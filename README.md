@@ -14,6 +14,7 @@ Filenames follow the same formating:
 where:
 - `$REP` is one of [spahm-a, spahm-b, spahm-a-global, spahm-b-global, slatm]
 - `$STATE` is one of [neutral, vertical, relaxed]
+- `$STATE` == neutral_0 correspond to neutral,singlet compounds treated as open-shell system (`spin=0`) for size consistency !
 
 
 ## Some reference papers

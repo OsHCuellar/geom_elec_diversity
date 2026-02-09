@@ -476,3 +476,55 @@ def gcmi_from_precomputed_blocks_union(
 
     I_bits = gcmi_cc(X_gcmi, y_gcmi)
     return float(I_bits)
+
+
+def gcmi_per_feature(
+    X,
+    y_array,
+    jitter_eps=1e-10,
+    seed=0,
+):
+    """
+    Compute Gaussian-Copula MI I(x_j ; y) for each individual feature column x_j.
+
+    Inputs
+    ------
+    X        : array-like, shape (N_samples, D_features)
+               Feature matrix (same format as for your plots).
+    y_array  : array-like, shape (N_samples,)
+               Scalar property values.
+    jitter_eps : float
+               Magnitude of jitter noise to break ties in ranks.
+    seed       : int
+               Random seed for jitter.
+
+    Returns
+    -------
+    I_vec : np.ndarray, shape (D_features,)
+            I(x_j ; y) in bits for each feature j.
+    """
+    X = np.asarray(X, float)
+    y = np.asarray(y_array, float).ravel()
+
+    if X.shape[0] != y.shape[0]:
+        raise ValueError("X rows and y_array length mismatch")
+
+    N_samples, D_features = X.shape
+
+    # y_gcmi is shared across features
+    y_gcmi = y.reshape(1, -1)  # (1, N_samples)
+    # jitter y once
+    y_gcmi = _jitter_rows_for_gcmi(y_gcmi, eps=jitter_eps, seed=seed + 1)
+
+    I_vec = np.empty(D_features, dtype=float)
+
+    for j in range(D_features):
+        # single feature -> shape (1, N_samples)
+        x_j = X[:, j].reshape(1, -1)
+        # jitter x_j
+        x_j = _jitter_rows_for_gcmi(x_j, eps=jitter_eps, seed=seed + j + 2)
+
+        # Gaussian-copula MI (bias-corrected) between x_j and y
+        I_vec[j] = gcmi_cc(x_j, y_gcmi)
+
+    return I_vec

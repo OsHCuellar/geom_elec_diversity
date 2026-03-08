@@ -786,66 +786,62 @@ def lb_guess_eigs_and_charges(mol, xc='pbe'):
 
       - H_LB = LB(mol, xc)
       - Solve H_LB C = S C eps
-      - Build spin-consistent density from occupied LB orbitals
+      - Build spin-consistent density from occupied LB orbitals (α and β)
       - Mulliken-like atomic charges from that density
 
     Returns:
-      eps      : (nao,) array of LB-guess MO energies
+      eps      : (nao,) LB-guess MO energies
       C        : (nao, nao) MO coefficients (columns = MOs)
-      n_occ    : number of *doubly-occupied* orbitals (min(Nα, Nβ))
+      n_occ    : CLOSED-SHELL-LIKE number of occupied spatial orbitals = floor(Ne/2)
+                (used ONLY for "frontier" indexing: HOMO/LUMO etc.)
       q_atomic : (natm,) Mulliken-like charges from LB density
       aoslice  : slices mapping atoms -> AOs
     """
-    # --- 1) LB Hamiltonian (effective one-electron) ---
+    # --- 1) LB Hamiltonian and generalized eigenproblem ---
     fock = LB(mol, xc)
-
-    # generalized eigenproblem H C = S C eps
     eps, C = solveF(mol, fock)   # (nao,), (nao, nao)
+
     eps = np.asarray(eps, float)
     C   = np.asarray(C, float)
-
     nao = C.shape[0]
 
-    # --- 2) Total electrons and spin from the Mole object ---
-    Ne = mol.nelectron            # total electrons (int)
+    # --- 2) Total electrons and spin ---
+    Ne = mol.nelectron
     if isinstance(Ne, tuple):
         Ne = sum(Ne)
+    Ne = int(Ne)
 
-    spin = int(mol.spin)          # PySCF convention: spin = Nα - Nβ = 2S
+    spin = int(mol.spin)  # PySCF convention: spin = Nα - Nβ
 
     # Nα, Nβ consistent with Ne and spin
-    # PySCF guarantees that (Ne + spin) and (Ne - spin) are even
     Nalpha = (Ne + spin) // 2
     Nbeta  = (Ne - spin) // 2
 
-    # Clamp to [0, nao] for safety on weird edge cases
-    Nalpha = max(0, min(nao, Nalpha))
-    Nbeta  = max(0, min(nao, Nbeta))
+    # Clamp for safety
+    Nalpha = max(0, min(nao, int(Nalpha)))
+    Nbeta  = max(0, min(nao, int(Nbeta)))
 
-    # Number of *doubly* occupied spatial orbitals
-    #n_occ = min(Nalpha, Nbeta)
-    n_occ = Nalpha
+    # --- 3) CLOSED-SHELL-LIKE frontier occupancy for HOMO/LUMO indexing ---
+    # This is the key change: use floor(Ne/2), independent of spin.
+    n_occ = max(0, min(nao, Ne // 2))
 
-    # --- 3) Build spin-resolved density from LB orbitals ---
-    # Use the same orbital ordering for α and β:
-    # α fills first Nα spatial orbitals, β fills first Nβ.
+    # --- 4) Spin-resolved density from LB orbitals (keep as you had it) ---
     if Nalpha > 0:
         C_alpha_occ = C[:, :Nalpha]
-        dm_alpha = C_alpha_occ @ C_alpha_occ.T   # occupancy 1 per α
+        dm_alpha = C_alpha_occ @ C_alpha_occ.T   # occupancy 1 per alpha
     else:
         dm_alpha = np.zeros((nao, nao), float)
 
     if Nbeta > 0:
         C_beta_occ = C[:, :Nbeta]
-        dm_beta = C_beta_occ @ C_beta_occ.T      # occupancy 1 per β
+        dm_beta = C_beta_occ @ C_beta_occ.T      # occupancy 1 per beta
     else:
         dm_beta = np.zeros((nao, nao), float)
 
-    # Total spin-summed density
-    dm = dm_alpha + dm_beta                      # (nao, nao)
+    dm = dm_alpha + dm_beta  # total density
 
-    # --- 4) Mulliken-like atomic populations / charges ---
-    S = mol.intor_symmetric('int1e_ovlp')        # (nao, nao)
+    # --- 5) Mulliken-like charges ---
+    S = mol.intor_symmetric('int1e_ovlp')
     PS = dm @ S
     pop_ao = np.diag(PS)
 
@@ -858,6 +854,85 @@ def lb_guess_eigs_and_charges(mol, xc='pbe'):
         q_atomic[ia] = Z[ia] - pop_ao[ibeg:iend].sum()
 
     return eps, C, n_occ, q_atomic, aoslice
+
+#def lb_guess_eigs_and_charges(mol, xc='pbe'):
+#    """
+#    Build a 'pre-SCF' electronic description using the LB2020 guess Hamiltonian:
+#
+#      - H_LB = LB(mol, xc)
+#      - Solve H_LB C = S C eps
+#      - Build spin-consistent density from occupied LB orbitals
+#      - Mulliken-like atomic charges from that density
+#
+#    Returns:
+#      eps      : (nao,) array of LB-guess MO energies
+#      C        : (nao, nao) MO coefficients (columns = MOs)
+#      n_occ    : number of *doubly-occupied* orbitals (min(Nα, Nβ))
+#      q_atomic : (natm,) Mulliken-like charges from LB density
+#      aoslice  : slices mapping atoms -> AOs
+#    """
+#    # --- 1) LB Hamiltonian (effective one-electron) ---
+#    fock = LB(mol, xc)
+#
+#    # generalized eigenproblem H C = S C eps
+#    eps, C = solveF(mol, fock)   # (nao,), (nao, nao)
+#    eps = np.asarray(eps, float)
+#    C   = np.asarray(C, float)
+#
+#    nao = C.shape[0]
+#
+#    # --- 2) Total electrons and spin from the Mole object ---
+#    Ne = mol.nelectron            # total electrons (int)
+#    if isinstance(Ne, tuple):
+#        Ne = sum(Ne)
+#
+#    spin = int(mol.spin)          # PySCF convention: spin = Nα - Nβ = 2S
+#
+#    # Nα, Nβ consistent with Ne and spin
+#    # PySCF guarantees that (Ne + spin) and (Ne - spin) are even
+#    Nalpha = (Ne + spin) // 2
+#    Nbeta  = (Ne - spin) // 2
+#
+#    # Clamp to [0, nao] for safety on weird edge cases
+#    Nalpha = max(0, min(nao, Nalpha))
+#    Nbeta  = max(0, min(nao, Nbeta))
+#
+#    # Number of *doubly* occupied spatial orbitals
+#    #n_occ = min(Nalpha, Nbeta)
+#    n_occ = Nalpha
+#
+#    # --- 3) Build spin-resolved density from LB orbitals ---
+#    # Use the same orbital ordering for α and β:
+#    # α fills first Nα spatial orbitals, β fills first Nβ.
+#    if Nalpha > 0:
+#        C_alpha_occ = C[:, :Nalpha]
+#        dm_alpha = C_alpha_occ @ C_alpha_occ.T   # occupancy 1 per α
+#    else:
+#        dm_alpha = np.zeros((nao, nao), float)
+#
+#    if Nbeta > 0:
+#        C_beta_occ = C[:, :Nbeta]
+#        dm_beta = C_beta_occ @ C_beta_occ.T      # occupancy 1 per β
+#    else:
+#        dm_beta = np.zeros((nao, nao), float)
+#
+#    # Total spin-summed density
+#    dm = dm_alpha + dm_beta                      # (nao, nao)
+#
+#    # --- 4) Mulliken-like atomic populations / charges ---
+#    S = mol.intor_symmetric('int1e_ovlp')        # (nao, nao)
+#    PS = dm @ S
+#    pop_ao = np.diag(PS)
+#
+#    aoslice = mol.aoslice_by_atom()
+#    Z = mol.atom_charges().astype(float)
+#    natm = mol.natm
+#
+#    q_atomic = np.zeros(natm, float)
+#    for ia, (ibeg, iend, _, _) in enumerate(aoslice):
+#        q_atomic[ia] = Z[ia] - pop_ao[ibeg:iend].sum()
+#
+#    return eps, C, n_occ, q_atomic, aoslice
 
 
 #def lb_guess_eigs_and_charges(mol, xc='pbe'):

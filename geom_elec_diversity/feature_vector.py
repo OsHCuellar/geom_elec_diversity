@@ -13,6 +13,8 @@ import random as rnd
 from qstack.compound import xyz_to_mol
 import time
 from qstack.spahm.guesses import LB, solveF
+from scipy.spatial.distance import pdist
+from sklearn.neighbors import NearestNeighbors
 
 
 
@@ -986,15 +988,51 @@ def lb_guess_eigs_and_charges(mol, xc='pbe'):
 #    return eps, C, n_occ, q_atomic, aoslice
 
 
+#def guess_frontier_energies_block(eps, n_occ):
+#    """
+#    5 features from orbital energies (guess or SCF):
+#      [HOMO, LUMO, gap, HOMO-1, LUMO+1]
+#    """
+#    if eps.size == 0:
+#        return np.zeros(5, float)
+#
+#    norb = eps.size
+#    if n_occ == 0:
+#        homo_idx = 0
+#        lumo_idx = min(1, norb - 1)
+#    else:
+#        homo_idx = min(n_occ - 1, norb - 1)
+#        lumo_idx = min(n_occ, norb - 1)
+#
+#    eH = float(eps[homo_idx])
+#    eL = float(eps[lumo_idx])
+#    gap = eL - eH
+#
+#    homo_m1_idx = max(homo_idx - 1, 0)
+#    lumo_p1_idx = min(lumo_idx + 1, norb - 1)
+#
+#    eH_m1 = float(eps[homo_m1_idx])
+#    eL_p1 = float(eps[lumo_p1_idx])
+#
+#    return np.array([eH, eL, gap, eH_m1, eL_p1], float)
+
 def guess_frontier_energies_block(eps, n_occ):
     """
-    5 features from orbital energies (guess or SCF):
-      [HOMO, LUMO, gap, HOMO-1, LUMO+1]
+    Frontier-energy block v2 (6 features):
+      [HOMO-3, HOMO-2, HOMO-1, HOMO, LUMO, gap]
+
+    Notes
+    -----
+    - `n_occ` is interpreted as the closed-shell-like number of occupied spatial orbitals.
+    - Indices are safely clamped at the spectrum edges.
     """
+    eps = np.asarray(eps, float).ravel()
     if eps.size == 0:
-        return np.zeros(5, float)
+        return np.zeros(6, float)
 
     norb = eps.size
+    n_occ = int(max(0, min(norb, n_occ)))
+
     if n_occ == 0:
         homo_idx = 0
         lumo_idx = min(1, norb - 1)
@@ -1002,32 +1040,73 @@ def guess_frontier_energies_block(eps, n_occ):
         homo_idx = min(n_occ - 1, norb - 1)
         lumo_idx = min(n_occ, norb - 1)
 
-    eH = float(eps[homo_idx])
-    eL = float(eps[lumo_idx])
-    gap = eL - eH
+    hm3 = max(homo_idx - 3, 0)
+    hm2 = max(homo_idx - 2, 0)
+    hm1 = max(homo_idx - 1, 0)
 
-    homo_m1_idx = max(homo_idx - 1, 0)
-    lumo_p1_idx = min(lumo_idx + 1, norb - 1)
+    e_hm3 = float(eps[hm3])
+    e_hm2 = float(eps[hm2])
+    e_hm1 = float(eps[hm1])
+    e_h   = float(eps[homo_idx])
+    e_l   = float(eps[lumo_idx])
+    gap   = float(e_l - e_h)
 
-    eH_m1 = float(eps[homo_m1_idx])
-    eL_p1 = float(eps[lumo_p1_idx])
-
-    return np.array([eH, eL, gap, eH_m1, eL_p1], float)
+    return np.array([e_hm3, e_hm2, e_hm1, e_h, e_l, gap], float)
 
 
-def guess_population_block(q_atomic):
+
+#def guess_population_block(q_atomic):
+#    """
+#    [ mean(|q|), max(|q|), std(q) ]
+#    """
+#    if q_atomic.size == 0:
+#        return np.zeros(3, float)
+#
+#    abs_q = np.abs(q_atomic)
+#    mean_absq = float(abs_q.mean())
+#    max_absq = float(abs_q.max())
+#    std_q = float(q_atomic.std()) if q_atomic.size > 1 else 0.0
+#
+#    return np.array([mean_absq, max_absq, std_q], float)
+
+def guess_population_block(mol, q_atomic):
     """
-    [ mean(|q|), max(|q|), std(q) ]
+    Element-resolved population block v2 (12 features).
+
+    For each heavy element in the order [C, N, O, S], compute:
+      [mean(|q|), max(|q|), std(q)]
+
+    If an element is absent, its 3 features are set to 0.
+
+    Output order:
+      C_meanabs, C_maxabs, C_std,
+      N_meanabs, N_maxabs, N_std,
+      O_meanabs, O_maxabs, O_std,
+      S_meanabs, S_maxabs, S_std
     """
-    if q_atomic.size == 0:
-        return np.zeros(3, float)
+    q_atomic = np.asarray(q_atomic, float).ravel()
+    natm = mol.natm
+    if natm == 0 or q_atomic.size == 0:
+        return np.zeros(12, float)
 
-    abs_q = np.abs(q_atomic)
-    mean_absq = float(abs_q.mean())
-    max_absq = float(abs_q.max())
-    std_q = float(q_atomic.std()) if q_atomic.size > 1 else 0.0
+    symbols = np.array([mol.atom_symbol(i) for i in range(natm)], dtype=object)
+    heavy_order = ['C', 'N', 'O', 'S']
 
-    return np.array([mean_absq, max_absq, std_q], float)
+    feats = []
+    for elem in heavy_order:
+        mask = (symbols == elem)
+        if np.any(mask):
+            q_e = q_atomic[mask]
+            abs_q = np.abs(q_e)
+            feats.extend([
+                float(abs_q.mean()),
+                float(abs_q.max()),
+                float(q_e.std()) if q_e.size > 1 else 0.0,
+            ])
+        else:
+            feats.extend([0.0, 0.0, 0.0])
+
+    return np.array(feats, float)
 
 
 def guess_frontier_element_fractions_block(mol, C, n_occ, aoslice):
@@ -1081,32 +1160,77 @@ def _atom_weights_from_C(mol, C, mo_idx, aoslice):
     return W_atom, total
 
 
+#def guess_ipr_entropy_block(mol, C, n_occ, aoslice):
+#    """
+#    IPR and Shannon entropy for HOMO and LUMO.
+#
+#    4 features:
+#      [IPR_HOMO, IPR_LUMO, S_HOMO, S_LUMO]
+#    """
+#    nao, norb = C.shape
+#    natm = mol.natm
+#    if norb == 0 or natm == 0:
+#        return np.zeros(4, float)
+#
+#    if n_occ == 0:
+#        homo_idx = 0
+#    else:
+#        homo_idx = min(n_occ - 1, norb - 1)
+#    lumo_idx = min(n_occ, norb - 1)
+#
+#    feats = []
+#    for mo_idx in (homo_idx, lumo_idx):
+#        W_atom, total = _atom_weights_from_C(mol, C, mo_idx, aoslice)
+#        p = W_atom / (total + 1e-12)
+#        ipr = float(np.sum(p ** 2))
+#        S = float(-np.sum(p * np.log(p + 1e-12)))  # entropy in nats
+#        feats.append(ipr)
+#        feats.append(S)
+#
+#    return np.array(feats, float)
+
 def guess_ipr_entropy_block(mol, C, n_occ, aoslice):
     """
-    IPR and Shannon entropy for HOMO and LUMO.
+    Frontier localization block v2 (9 features).
 
-    4 features:
-      [IPR_HOMO, IPR_LUMO, S_HOMO, S_LUMO]
+    For the orbitals [HOMO-1, HOMO, LUMO], compute:
+      [IPR, Shannon entropy, max atomic participation]
+
+    Output order:
+      IPR(HOMO-1), S(HOMO-1), maxw(HOMO-1),
+      IPR(HOMO),   S(HOMO),   maxw(HOMO),
+      IPR(LUMO),   S(LUMO),   maxw(LUMO)
+
+    where:
+      - IPR = sum_i p_i^2
+      - S   = -sum_i p_i log p_i
+      - maxw = max_i p_i
+      - p_i are atom-normalized MO weights
     """
     nao, norb = C.shape
     natm = mol.natm
     if norb == 0 or natm == 0:
-        return np.zeros(4, float)
+        return np.zeros(9, float)
+
+    n_occ = int(max(0, min(norb, n_occ)))
 
     if n_occ == 0:
         homo_idx = 0
+        lumo_idx = min(1, norb - 1)
     else:
         homo_idx = min(n_occ - 1, norb - 1)
-    lumo_idx = min(n_occ, norb - 1)
+        lumo_idx = min(n_occ, norb - 1)
+
+    hm1_idx = max(homo_idx - 1, 0)
 
     feats = []
-    for mo_idx in (homo_idx, lumo_idx):
+    for mo_idx in (hm1_idx, homo_idx, lumo_idx):
         W_atom, total = _atom_weights_from_C(mol, C, mo_idx, aoslice)
         p = W_atom / (total + 1e-12)
         ipr = float(np.sum(p ** 2))
-        S = float(-np.sum(p * np.log(p + 1e-12)))  # entropy in nats
-        feats.append(ipr)
-        feats.append(S)
+        S = float(-np.sum(p * np.log(p + 1e-12)))
+        maxw = float(np.max(p)) if p.size else 0.0
+        feats.extend([ipr, S, maxw])
 
     return np.array(feats, float)
 
@@ -1147,11 +1271,18 @@ def fukui_block(mol, C, n_occ, aoslice):
 
 # Block sizes for electronic features
 # Not general
+#GUESS_ELEC_BLOCK_SIZES = {
+#    'guess_frontier_energies': 5,
+#    'guess_population': 3,
+#    'guess_frontier_element_fractions': 10,
+#    'guess_ipr_entropy': 4,
+#    'fukui': 6,
+#}
 GUESS_ELEC_BLOCK_SIZES = {
-    'guess_frontier_energies': 5,
-    'guess_population': 3,
+    'guess_frontier_energies': 6,
+    'guess_population': 12,
     'guess_frontier_element_fractions': 10,
-    'guess_ipr_entropy': 4,
+    'guess_ipr_entropy': 9,
     'fukui': 6,
 }
 
@@ -1164,19 +1295,66 @@ GUESS_ELEC_BLOCKS_DEFAULT = (
 )
 
 
+#def guess_elec_features_for_molecule(
+#    mol,
+#    elec_blocks=GUESS_ELEC_BLOCKS_DEFAULT,
+#    xc='pbe',
+#):
+#    """
+#    Build the 'initial-guess' electronic descriptor from LB2020 Hamiltonian.
+#
+#    Supports blocks:
+#      - 'guess_frontier_energies'          (5)
+#      - 'guess_population'                 (3)
+#      - 'guess_frontier_element_fractions' (10)
+#      - 'guess_ipr_entropy'                (4)
+#      - 'fukui'                            (6)
+#    """
+#    elec_blocks = tuple(elec_blocks)
+#    if len(elec_blocks) == 0:
+#        return np.zeros(0, float)
+#
+#    eps, C, n_occ, q_atomic, aoslice = lb_guess_eigs_and_charges(mol, xc=xc)
+#
+#    chunks = []
+#    for b in elec_blocks:
+#        if b == 'guess_frontier_energies':
+#            chunks.append(guess_frontier_energies_block(eps, n_occ))
+#        elif b == 'guess_population':
+#            chunks.append(guess_population_block(q_atomic))
+#        elif b == 'guess_frontier_element_fractions':
+#            chunks.append(
+#                guess_frontier_element_fractions_block(mol, C, n_occ, aoslice)
+#            )
+#        elif b == 'guess_ipr_entropy':
+#            chunks.append(
+#                guess_ipr_entropy_block(mol, C, n_occ, aoslice)
+#            )
+#        elif b == 'fukui':
+#            chunks.append(
+#                fukui_block(mol, C, n_occ, aoslice)
+#            )
+#        else:
+#            raise ValueError(f"Unknown guess-electronic block '{b}'")
+#
+#    if not chunks:
+#        return np.zeros(0, float)
+#
+#    return np.concatenate(chunks, axis=0)
+
 def guess_elec_features_for_molecule(
     mol,
     elec_blocks=GUESS_ELEC_BLOCKS_DEFAULT,
     xc='pbe',
 ):
     """
-    Build the 'initial-guess' electronic descriptor from LB2020 Hamiltonian.
+    Build the 'initial-guess' electronic descriptor from the LB2020 Hamiltonian.
 
     Supports blocks:
-      - 'guess_frontier_energies'          (5)
-      - 'guess_population'                 (3)
+      - 'guess_frontier_energies'          (6)
+      - 'guess_population'                 (12)
       - 'guess_frontier_element_fractions' (10)
-      - 'guess_ipr_entropy'                (4)
+      - 'guess_ipr_entropy'                (9)
       - 'fukui'                            (6)
     """
     elec_blocks = tuple(elec_blocks)
@@ -1190,7 +1368,7 @@ def guess_elec_features_for_molecule(
         if b == 'guess_frontier_energies':
             chunks.append(guess_frontier_energies_block(eps, n_occ))
         elif b == 'guess_population':
-            chunks.append(guess_population_block(q_atomic))
+            chunks.append(guess_population_block(mol, q_atomic))
         elif b == 'guess_frontier_element_fractions':
             chunks.append(
                 guess_frontier_element_fractions_block(mol, C, n_occ, aoslice)
@@ -1212,26 +1390,76 @@ def guess_elec_features_for_molecule(
     return np.concatenate(chunks, axis=0)
 
 
+#def scf_elec_features_for_molecule(
+#    mol,
+#    elec_blocks=GUESS_ELEC_BLOCKS_DEFAULT, 
+#    xc_scf='PBE0', xc_lb='pbe'
+#):
+#    """
+#    Build the electronic descriptor using the *converged SCF* solution.
+#    """
+#    elec_blocks = tuple(elec_blocks)
+#    if len(elec_blocks) == 0:
+#        return np.zeros(0, float)
+#
+#    eps, C, n_occ, q_atomic, aoslice = scf_eigs_and_charges(mol,  xc_scf=xc_scf, xc_lb=xc_lb)
+#
+#    chunks = []
+#    for b in elec_blocks:
+#        if b == 'guess_frontier_energies':
+#            chunks.append(guess_frontier_energies_block(eps, n_occ))
+#        elif b == 'guess_population':
+#            chunks.append(guess_population_block(q_atomic))
+#        elif b == 'guess_frontier_element_fractions':
+#            chunks.append(
+#                guess_frontier_element_fractions_block(mol, C, n_occ, aoslice)
+#            )
+#        elif b == 'guess_ipr_entropy':
+#            chunks.append(
+#                guess_ipr_entropy_block(mol, C, n_occ, aoslice)
+#            )
+#        elif b == 'fukui':
+#            chunks.append(
+#                fukui_block(mol, C, n_occ, aoslice)
+#            )
+#        else:
+#            raise ValueError(f"Unknown SCF-electronic block '{b}'")
+#
+#    if not chunks:
+#        return np.zeros(0, float)
+#
+#    return np.concatenate(chunks, axis=0)
+
 def scf_elec_features_for_molecule(
     mol,
-    elec_blocks=GUESS_ELEC_BLOCKS_DEFAULT, 
-    xc_scf='PBE0', xc_lb='pbe'
+    elec_blocks=GUESS_ELEC_BLOCKS_DEFAULT,
+    xc_scf='PBE0',
+    xc_lb='pbe'
 ):
     """
-    Build the electronic descriptor using the *converged SCF* solution.
+    Build the electronic descriptor using the converged SCF solution.
+
+    Supports blocks:
+      - 'guess_frontier_energies'          (6)
+      - 'guess_population'                 (12)
+      - 'guess_frontier_element_fractions' (10)
+      - 'guess_ipr_entropy'                (9)
+      - 'fukui'                            (6)
     """
     elec_blocks = tuple(elec_blocks)
     if len(elec_blocks) == 0:
         return np.zeros(0, float)
 
-    eps, C, n_occ, q_atomic, aoslice = scf_eigs_and_charges(mol,  xc_scf=xc_scf, xc_lb=xc_lb)
+    eps, C, n_occ, q_atomic, aoslice = scf_eigs_and_charges(
+        mol, xc_scf=xc_scf, xc_lb=xc_lb
+    )
 
     chunks = []
     for b in elec_blocks:
         if b == 'guess_frontier_energies':
             chunks.append(guess_frontier_energies_block(eps, n_occ))
         elif b == 'guess_population':
-            chunks.append(guess_population_block(q_atomic))
+            chunks.append(guess_population_block(mol, q_atomic))
         elif b == 'guess_frontier_element_fractions':
             chunks.append(
                 guess_frontier_element_fractions_block(mol, C, n_occ, aoslice)
@@ -1620,3 +1848,165 @@ def _assert_block_slice_consistency(X_all, block_slices, reference_blocks, atol=
                 f"max|X_all[:, slice] - reference| = {diff}"
             )
 
+
+
+
+
+
+
+def descriptor_block_stats(X, var_eps=1e-8, k_nn=5):
+    """
+    X: (n_samples, n_dims)
+    Returns a dict of raw-space statistics for understanding spread, density, and effective volume.
+    """
+    X = np.asarray(X, float)
+    n_samples, n_dims = X.shape
+
+    stds = X.std(axis=0)
+    near_const = stds <= var_eps
+    n_near_const = int(np.sum(near_const))
+
+    X_keep = X[:, ~near_const]
+    kept_dims = X_keep.shape[1]
+
+    out = {
+        "n_samples": int(n_samples),
+        "n_dims": int(n_dims),
+        "n_kept_dims": int(kept_dims),
+        "n_near_const_dims": int(n_near_const),
+        "mean_std": float(np.mean(stds)) if stds.size else np.nan,
+        "median_std": float(np.median(stds)) if stds.size else np.nan,
+        "min_std": float(np.min(stds)) if stds.size else np.nan,
+        "max_std": float(np.max(stds)) if stds.size else np.nan,
+    }
+
+    if kept_dims == 0 or n_samples < 2:
+        out.update({
+            "mean_pairwise_dist": np.nan,
+            "median_pairwise_dist": np.nan,
+            "std_pairwise_dist": np.nan,
+            "p05_pairwise_dist": np.nan,
+            "p95_pairwise_dist": np.nan,
+            "knn_mean_dist": np.nan,
+            "knn_median_dist": np.nan,
+            "trace_cov": np.nan,
+            "logdet_cov": np.nan,
+            "largest_eig": np.nan,
+            "largest_eig_frac": np.nan,
+            "effective_rank": np.nan,
+        })
+        return out
+
+    # Pairwise distances
+    d = pdist(X_keep, metric="euclidean")
+    out.update({
+        "mean_pairwise_dist": float(np.mean(d)),
+        "median_pairwise_dist": float(np.median(d)),
+        "std_pairwise_dist": float(np.std(d)),
+        "p05_pairwise_dist": float(np.percentile(d, 5)),
+        "p95_pairwise_dist": float(np.percentile(d, 95)),
+    })
+
+    # kNN distances
+    k_use = min(k_nn + 1, n_samples)
+    nn = NearestNeighbors(n_neighbors=k_use, metric="euclidean")
+    nn.fit(X_keep)
+    dist_nn, _ = nn.kneighbors(X_keep)
+    # first column is self-distance = 0
+    if k_use > 1:
+        knn_d = dist_nn[:, 1:]
+        out.update({
+            "knn_mean_dist": float(np.mean(knn_d)),
+            "knn_median_dist": float(np.median(knn_d)),
+        })
+    else:
+        out.update({
+            "knn_mean_dist": np.nan,
+            "knn_median_dist": np.nan,
+        })
+
+    # Covariance-based stats
+    Xc = X_keep - X_keep.mean(axis=0, keepdims=True)
+    C = np.cov(Xc, rowvar=False)
+
+    if kept_dims == 1:
+        eigvals = np.array([float(C)])
+    else:
+        C = 0.5 * (C + C.T)
+        eigvals = np.linalg.eigvalsh(C)
+
+    eigvals = np.clip(eigvals, 0.0, None)
+
+    trace_cov = float(np.sum(eigvals))
+    largest_eig = float(np.max(eigvals)) if eigvals.size else np.nan
+    largest_eig_frac = float(largest_eig / trace_cov) if trace_cov > 1e-20 else np.nan
+
+    # Effective rank / participation ratio
+    if np.sum(eigvals) > 1e-20 and np.sum(eigvals**2) > 1e-20:
+        effective_rank = float((np.sum(eigvals) ** 2) / np.sum(eigvals ** 2))
+    else:
+        effective_rank = np.nan
+
+    # Pseudo-logdet on positive eigvals only
+    pos = eigvals[eigvals > var_eps]
+    logdet_cov = float(np.sum(np.log(pos))) if pos.size > 0 else np.nan
+
+    out.update({
+        "trace_cov": trace_cov,
+        "logdet_cov": logdet_cov,
+        "largest_eig": largest_eig,
+        "largest_eig_frac": largest_eig_frac,
+        "effective_rank": effective_rank,
+    })
+
+    return out
+
+
+def all_block_stats(X_all, block_slices, block_keys=None, var_eps=1e-8, k_nn=5):
+    if block_keys is None:
+        block_keys = list(block_slices.keys())
+
+    stats = {}
+    for key in block_keys:
+        Xb = X_all[:, block_slices[key]]
+        stats[key] = descriptor_block_stats(Xb, var_eps=var_eps, k_nn=k_nn)
+    return stats
+
+
+def print_block_stats(stats):
+    keys = [
+        "n_dims", "n_kept_dims", "n_near_const_dims",
+        "mean_std", "mean_pairwise_dist", "knn_mean_dist",
+        "trace_cov", "logdet_cov", "effective_rank", "largest_eig_frac"
+    ]
+    for block, s in stats.items():
+        print(f"\n=== {block} ===")
+        for k in keys:
+            print(f"{k}: {s[k]}")
+
+
+
+def write_block_stats(stats, filepath):
+    """
+    Write block statistics to a text file.
+
+    Parameters
+    ----------
+    stats : dict
+        Output from all_block_stats(...)
+    filepath : str
+        Full path to output file (including directory and filename)
+    """
+
+    keys = [
+        "n_dims", "n_kept_dims", "n_near_const_dims",
+        "mean_std", "mean_pairwise_dist", "knn_mean_dist",
+        "trace_cov", "logdet_cov", "effective_rank", "largest_eig_frac"
+    ]
+
+    with open(filepath, "w") as f:
+        for block, s in stats.items():
+            f.write(f"\n=== {block} ===\n")
+            for k in keys:
+                val = s.get(k, None)
+                f.write(f"{k}: {val}\n")

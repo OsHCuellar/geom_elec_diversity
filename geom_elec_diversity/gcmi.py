@@ -55,60 +55,154 @@ def copnorm(x):
     return cx
 
 
-def mi_gg(x, y, biascorrect=True, demeaned=False):
-    """
-    Mutual information (MI) between two Gaussian variables in bits.
+#def mi_gg(x, y, biascorrect=True, demeaned=False):
+#    """
+#    Mutual information (MI) between two Gaussian variables in bits.
+#
+#    x, y : arrays with shape (N_var, N_trials)
+#           (variables in rows, trials in columns)
+#    """
+#    x = np.atleast_2d(x)
+#    y = np.atleast_2d(y)
+#    if x.ndim > 2 or y.ndim > 2:
+#        raise ValueError("x and y must be at most 2D")
+#
+#    Ntrl = x.shape[1]
+#    Nvarx = x.shape[0]
+#    Nvary = y.shape[0]
+#    Nvarxy = Nvarx + Nvary
+#
+#    if y.shape[1] != Ntrl:
+#        raise ValueError("number of trials do not match")
+#
+#    # joint variable
+#    xy = np.vstack((x, y))
+#    if not demeaned:
+#        xy = xy - xy.mean(axis=1)[:, np.newaxis]
+#
+#    Cxy = np.dot(xy, xy.T) / float(Ntrl - 1)
+#
+#    # sub-covariances
+#    Cx = Cxy[:Nvarx, :Nvarx]
+#    Cy = Cxy[Nvarx:, Nvarx:]
+#
+#    chCxy = np.linalg.cholesky(Cxy)
+#    chCx = np.linalg.cholesky(Cx)
+#    chCy = np.linalg.cholesky(Cy)
+#
+#    # entropies in nats (normalization constants cancel in MI)
+#    HX = np.sum(np.log(np.diagonal(chCx)))
+#    HY = np.sum(np.log(np.diagonal(chCy)))
+#    HXY = np.sum(np.log(np.diagonal(chCxy)))
+#
+#    ln2 = np.log(2)
+#    if biascorrect:
+#        psiterms = sp.special.psi(
+#            (Ntrl - np.arange(1, Nvarxy + 1)).astype(np.float) / 2.0
+#        ) / 2.0
+#        dterm = (ln2 - np.log(Ntrl - 1.0)) / 2.0
+#
+#        HX = HX - Nvarx * dterm - psiterms[:Nvarx].sum()
+#        HY = HY - Nvary * dterm - psiterms[:Nvary].sum()
+#        HXY = HXY - Nvarxy * dterm - psiterms[:Nvarxy].sum()
+#
+#    I = (HX + HY - HXY) / ln2  # in bits
+#    return I
 
-    x, y : arrays with shape (N_var, N_trials)
-           (variables in rows, trials in columns)
+def mi_gg(x, y, biascorrect=True, demeaned=False, ridge_rel=1e-10, max_tries=8):
+    """
+    Mutual information between two Gaussian variables in bits.
+
+    Parameters
+    ----------
+    x, y : arrays
+        Variables in rows, samples in columns.
+    biascorrect : bool
+        Whether to apply finite-sample bias correction.
+    demeaned : bool
+        If False, demean x and y internally.
+    ridge_rel : float
+        Relative ridge strength used if covariance matrices are numerically
+        non-positive-definite.
+    max_tries : int
+        Number of adaptive ridge attempts.
+
+    Returns
+    -------
+    I : float
+        Mutual information in bits.
     """
     x = np.atleast_2d(x)
     y = np.atleast_2d(y)
+
     if x.ndim > 2 or y.ndim > 2:
-        raise ValueError("x and y must be at most 2D")
+        raise ValueError("x and y must be at most 2d")
+    if x.shape[1] != y.shape[1]:
+        raise ValueError("x and y must have the same number of trials")
 
     Ntrl = x.shape[1]
     Nvarx = x.shape[0]
     Nvary = y.shape[0]
     Nvarxy = Nvarx + Nvary
 
-    if y.shape[1] != Ntrl:
-        raise ValueError("number of trials do not match")
+    if Ntrl < 2:
+        raise ValueError("Need at least 2 trials to estimate MI")
 
-    # joint variable
-    xy = np.vstack((x, y))
     if not demeaned:
-        xy = xy - xy.mean(axis=1)[:, np.newaxis]
+        x = x - x.mean(axis=1, keepdims=True)
+        y = y - y.mean(axis=1, keepdims=True)
 
+    xy = np.vstack((x, y))
+
+    Cx = np.dot(x, x.T) / float(Ntrl - 1)
+    Cy = np.dot(y, y.T) / float(Ntrl - 1)
     Cxy = np.dot(xy, xy.T) / float(Ntrl - 1)
 
-    # sub-covariances
-    Cx = Cxy[:Nvarx, :Nvarx]
-    Cy = Cxy[Nvarx:, Nvarx:]
+    # enforce symmetry numerically
+    Cx = 0.5 * (Cx + Cx.T)
+    Cy = 0.5 * (Cy + Cy.T)
+    Cxy = 0.5 * (Cxy + Cxy.T)
 
-    chCxy = np.linalg.cholesky(Cxy)
-    chCx = np.linalg.cholesky(Cx)
-    chCy = np.linalg.cholesky(Cy)
+    def _chol_with_ridge(C, nvar, label):
+        avg_var = float(np.mean(np.diag(C))) if C.size else 0.0
+        base = max(avg_var, 1.0) * float(ridge_rel)
+        ridge = 0.0
 
-    # entropies in nats (normalization constants cancel in MI)
+        for k in range(max_tries + 1):
+            try:
+                if ridge == 0.0:
+                    return np.linalg.cholesky(C)
+                return np.linalg.cholesky(C + ridge * np.eye(nvar))
+            except np.linalg.LinAlgError:
+                if k == max_tries:
+                    eigmin = float(np.min(np.linalg.eigvalsh(C)))
+                    raise np.linalg.LinAlgError(
+                        f"{label} not positive definite even after ridge regularization. "
+                        f"min_eig={eigmin:.3e}, final_ridge={ridge:.3e}, nvar={nvar}"
+                    )
+                ridge = base * (10.0 ** k)
+
+    chCx = _chol_with_ridge(Cx, Nvarx, "Cx")
+    chCy = _chol_with_ridge(Cy, Nvary, "Cy")
+    chCxy = _chol_with_ridge(Cxy, Nvarxy, "Cxy")
+
     HX = np.sum(np.log(np.diagonal(chCx)))
     HY = np.sum(np.log(np.diagonal(chCy)))
     HXY = np.sum(np.log(np.diagonal(chCxy)))
 
-    ln2 = np.log(2)
+    ln2 = np.log(2.0)
+    I = (HX + HY - HXY) / ln2
+
     if biascorrect:
-        psiterms = sp.special.psi(
-            (Ntrl - np.arange(1, Nvarxy + 1)).astype(np.float) / 2.0
-        ) / 2.0
+        psix = sp.special.psi((Ntrl - np.arange(1, Nvarx + 1).astype(np.float)) / 2.0) / 2.0
+        psiy = sp.special.psi((Ntrl - np.arange(1, Nvary + 1).astype(np.float)) / 2.0) / 2.0
+        psixy = sp.special.psi((Ntrl - np.arange(1, Nvarxy + 1).astype(np.float)) / 2.0) / 2.0
         dterm = (ln2 - np.log(Ntrl - 1.0)) / 2.0
+        I = I - (Nvarx * dterm + psix.sum()) / ln2 \
+              - (Nvary * dterm + psiy.sum()) / ln2 \
+              + (Nvarxy * dterm + psixy.sum()) / ln2
 
-        HX = HX - Nvarx * dterm - psiterms[:Nvarx].sum()
-        HY = HY - Nvary * dterm - psiterms[:Nvary].sum()
-        HXY = HXY - Nvarxy * dterm - psiterms[:Nvarxy].sum()
-
-    I = (HX + HY - HXY) / ln2  # in bits
     return I
-
 
 def gcmi_cc(x, y):
     """
@@ -174,6 +268,33 @@ def _jitter_rows_for_gcmi(A, eps=1e-10, seed=0):
             A[i, :] = row + eps * rng.standard_normal(size=n_trials)
     return A
 
+def _drop_near_constant_rows_for_gcmi(A, eps=1e-8):
+    """
+    Drop rows (variables) with near-zero variance across trials.
+
+    Parameters
+    ----------
+    A : array, shape (N_var, N_trials)
+        Variables in rows, trials in columns.
+    eps : float
+        Variance threshold. Rows with std <= eps are removed.
+
+    Returns
+    -------
+    A_keep : ndarray
+        Filtered matrix with only non-degenerate rows.
+    keep_mask : ndarray of bool, shape (N_var,)
+        Boolean mask of kept rows.
+    """
+    A = np.asarray(A, float)
+    if A.ndim != 2:
+        raise ValueError("A must be 2D (N_var, N_trials)")
+    if A.shape[0] == 0:
+        return A, np.zeros((0,), dtype=bool)
+
+    stds = A.std(axis=1)
+    keep = stds > eps
+    return A[keep, :], keep
 
 def prepare_gcmi_from_precomputed(
     X_all,
@@ -215,6 +336,48 @@ def prepare_gcmi_from_precomputed(
     return X_gcmi, y_gcmi
 
 
+#def gcmi_from_precomputed(
+#    X_all,
+#    y_array,
+#    block_slices,
+#    block_key,
+#    jitter_eps=1e-10,
+#    seed=0,
+#    ):
+#    """
+#    Compute I( X_block ; y ) using gcmi_cc, where X_block is a subset of
+#    columns from the PRECOMPUTED feature matrix X_all.
+#
+#    Inputs:
+#      X_all        : (N_samples, D_total)
+#      y_array      : 1D array of property values (N_samples,)
+#      block_slices : dict mapping block_name -> slice (or index array)
+#      block_key    : which block to use, e.g.
+#                       'all', 'geom_all', 'elec_all',
+#                       'composition', 'shape', 'guess_frontier_energies', ...
+#
+#    Returns:
+#      I_bits : float, mutual information in bits.
+#    """
+#    if block_key not in block_slices:
+#        raise KeyError(
+#            f"Unknown block key '{block_key}'. Available keys: {list(block_slices.keys())}"
+#        )
+#
+#    col_slice = block_slices[block_key]
+#
+#    X_gcmi, y_gcmi = prepare_gcmi_from_precomputed(
+#        X_all,
+#        y_array,
+#        col_slice=col_slice,
+#        jitter_eps=jitter_eps,
+#        seed=seed,
+#    )
+#
+#    I_bits = gcmi_cc(X_gcmi, y_gcmi)
+#    return float(I_bits)
+
+
 def gcmi_from_precomputed(
     X_all,
     y_array,
@@ -222,21 +385,18 @@ def gcmi_from_precomputed(
     block_key,
     jitter_eps=1e-10,
     seed=0,
-    ):
+    var_eps=1e-8,
+    return_meta=False,
+):
     """
     Compute I( X_block ; y ) using gcmi_cc, where X_block is a subset of
     columns from the PRECOMPUTED feature matrix X_all.
 
-    Inputs:
-      X_all        : (N_samples, D_total)
-      y_array      : 1D array of property values (N_samples,)
-      block_slices : dict mapping block_name -> slice (or index array)
-      block_key    : which block to use, e.g.
-                       'all', 'geom_all', 'elec_all',
-                       'composition', 'shape', 'guess_frontier_energies', ...
+    Robust to near-constant columns: they are dropped locally inside the estimator.
 
     Returns:
-      I_bits : float, mutual information in bits.
+      I_bits : float
+      meta   : dict (optional)
     """
     if block_key not in block_slices:
         raise KeyError(
@@ -253,30 +413,123 @@ def gcmi_from_precomputed(
         seed=seed,
     )
 
-    I_bits = gcmi_cc(X_gcmi, y_gcmi)
+    n_input_dims = int(X_gcmi.shape[0])
+
+    # Drop near-constant rows locally
+    X_gcmi, keep_mask = _drop_near_constant_rows_for_gcmi(X_gcmi, eps=var_eps)
+    kept_dims = int(X_gcmi.shape[0])
+
+    if kept_dims == 0:
+        I_bits = 0.0
+    else:
+        I_bits = gcmi_cc(X_gcmi, y_gcmi)
+
+    if return_meta:
+        meta = {
+            "block_key": block_key,
+            "n_input_dims": n_input_dims,
+            "n_kept_dims": kept_dims,
+            "n_dropped_dims": n_input_dims - kept_dims,
+            "kept_mask_rows": keep_mask,
+            "var_eps": float(var_eps),
+        }
+        return float(I_bits), meta
+
     return float(I_bits)
 
 
-def ent_g(x, biascorrect=True):
-    """
-    Entropy of a Gaussian variable in bits
+#def ent_g(x, biascorrect=True):
+#    """
+#    Entropy of a Gaussian variable in bits
+#
+#    H = ent_g(x) returns the entropy of a (possibly
+#    multidimensional) Gaussian variable x with bias correction.
+#    Columns of x correspond to samples, rows to dimensions/variables.
+#    (Samples last axis)
+#    """
+#    x = np.atleast_2d(x)
+#    if x.ndim > 2:
+#        raise ValueError("x must be at most 2d")
+#    Ntrl = x.shape[1]
+#    Nvarx = x.shape[0]
+#
+#    # demean data
+#    x = x - x.mean(axis=1)[:, np.newaxis]
+#    # covariance
+#    C = np.dot(x, x.T) / float(Ntrl - 1)
+#    chC = np.linalg.cholesky(C)
+#
+#    # entropy in nats
+#    HX = np.sum(np.log(np.diagonal(chC))) + 0.5 * Nvarx * (np.log(2 * np.pi) + 1.0)
+#
+#    ln2 = np.log(2)
+#    if biascorrect:
+#        psiterms = sp.special.psi(
+#            (Ntrl - np.arange(1, Nvarx + 1).astype(np.float)) / 2.0
+#        ) / 2.0
+#        dterm = (ln2 - np.log(Ntrl - 1.0)) / 2.0
+#        HX = HX - Nvarx * dterm - psiterms.sum()
+#
+#    # convert to bits
+#    return HX / ln2
 
-    H = ent_g(x) returns the entropy of a (possibly
-    multidimensional) Gaussian variable x with bias correction.
+def ent_g(x, biascorrect=True, ridge_rel=1e-10, max_tries=8):
+    """
+    Entropy of a Gaussian variable in bits.
+
+    H = ent_g(x) returns the entropy of a (possibly multidimensional)
+    Gaussian variable x with bias correction.
     Columns of x correspond to samples, rows to dimensions/variables.
     (Samples last axis)
+
+    This version is robust to numerical non-positive-definiteness:
+    if the covariance is nearly singular, it adds a tiny adaptive ridge
+    to the diagonal until Cholesky succeeds.
     """
     x = np.atleast_2d(x)
     if x.ndim > 2:
         raise ValueError("x must be at most 2d")
+
     Ntrl = x.shape[1]
     Nvarx = x.shape[0]
 
+    if Ntrl < 2:
+        raise ValueError("Need at least 2 trials to estimate entropy")
+
     # demean data
     x = x - x.mean(axis=1)[:, np.newaxis]
+
     # covariance
     C = np.dot(x, x.T) / float(Ntrl - 1)
-    chC = np.linalg.cholesky(C)
+
+    # enforce symmetry numerically
+    C = 0.5 * (C + C.T)
+
+    # Try plain Cholesky first, then add adaptive ridge if needed
+    ridge = 0.0
+    chC = None
+
+    # scale the ridge by the average variance so it is dimensionless / adaptive
+    avg_var = float(np.mean(np.diag(C))) if C.size else 0.0
+    base = max(avg_var, 1.0) * float(ridge_rel)
+
+    for k in range(max_tries + 1):
+        try:
+            if ridge == 0.0:
+                chC = np.linalg.cholesky(C)
+            else:
+                chC = np.linalg.cholesky(C + ridge * np.eye(Nvarx))
+            break
+        except np.linalg.LinAlgError:
+            if k == max_tries:
+                # give a more informative error
+                eigmin = float(np.min(np.linalg.eigvalsh(C)))
+                raise np.linalg.LinAlgError(
+                    f"Matrix is not positive definite even after ridge regularization. "
+                    f"min_eig={eigmin:.3e}, final_ridge={ridge:.3e}, "
+                    f"Nvar={Nvarx}, Ntrl={Ntrl}"
+                )
+            ridge = base * (10.0 ** k)
 
     # entropy in nats
     HX = np.sum(np.log(np.diagonal(chC))) + 0.5 * Nvarx * (np.log(2 * np.pi) + 1.0)
@@ -323,24 +576,73 @@ def gc_entropy(x, biascorrect=True, jitter_eps=1e-10, seed=0):
     return float(H_bits)
 
 
+#def gc_entropy_from_precomputed(
+#    X_all,
+#    block_slices,
+#    block_key,
+#    jitter_eps=1e-10,
+#    seed=0,
+#):
+#    """
+#    Gaussian-Copula entropy H(X_block) in bits, where X_block is a subset of
+#    columns from the PRECOMPUTED feature matrix X_all.
+#
+#    Inputs:
+#      X_all        : (N_samples, D_total)
+#      block_slices : dict mapping block_name -> slice (or index array)
+##      block_key    : which block to use (same keys as in gcmi_from_precomputed)
+#
+#    Returns:
+#      H_bits : float, entropy in bits.
+#    """
+#    if block_key not in block_slices:
+#        raise KeyError(
+#            f"Unknown block key '{block_key}'. Available keys: {list(block_slices.keys())}"
+#        )
+#
+#    col_slice = block_slices[block_key]
+#
+#    # reuse your precomputed-prep helper
+#    X_gcmi, _ = prepare_gcmi_from_precomputed(
+#        X_all,
+#        y_array=np.zeros(X_all.shape[0]),  # dummy, not used
+#        col_slice=col_slice,
+#        jitter_eps=jitter_eps,
+#        seed=seed,
+#    )
+#    # y_gcmi is ignored; we only want X_gcmi
+#    H_bits = gc_entropy(X_gcmi, biascorrect=True, jitter_eps=0.0, seed=seed)
+#    return float(H_bits)
+
 def gc_entropy_from_precomputed(
     X_all,
     block_slices,
     block_key,
     jitter_eps=1e-10,
     seed=0,
+    var_eps=1e-8,
+    return_meta=False,
 ):
     """
     Gaussian-Copula entropy H(X_block) in bits, where X_block is a subset of
     columns from the PRECOMPUTED feature matrix X_all.
 
+    This version is robust to near-constant columns in the selected block:
+    such columns are dropped locally inside the estimator, while the original
+    descriptor indexing / block_slices remain unchanged.
+
     Inputs:
       X_all        : (N_samples, D_total)
       block_slices : dict mapping block_name -> slice (or index array)
       block_key    : which block to use (same keys as in gcmi_from_precomputed)
+      jitter_eps   : small jitter to break ties before copula normalization
+      seed         : RNG seed
+      var_eps      : threshold for dropping near-constant variables
+      return_meta  : if True, also return info about dropped dimensions
 
     Returns:
-      H_bits : float, entropy in bits.
+      H_bits : float, entropy in bits
+      meta   : dict (optional)
     """
     if block_key not in block_slices:
         raise KeyError(
@@ -349,7 +651,7 @@ def gc_entropy_from_precomputed(
 
     col_slice = block_slices[block_key]
 
-    # reuse your precomputed-prep helper
+    # Prepare in GCMI layout: (N_var, N_trials)
     X_gcmi, _ = prepare_gcmi_from_precomputed(
         X_all,
         y_array=np.zeros(X_all.shape[0]),  # dummy, not used
@@ -357,62 +659,170 @@ def gc_entropy_from_precomputed(
         jitter_eps=jitter_eps,
         seed=seed,
     )
-    # y_gcmi is ignored; we only want X_gcmi
-    H_bits = gc_entropy(X_gcmi, biascorrect=True, jitter_eps=0.0, seed=seed)
+
+    n_input_dims = int(X_gcmi.shape[0])
+
+    # Drop near-constant rows locally for entropy estimation
+    X_gcmi, keep_mask = _drop_near_constant_rows_for_gcmi(X_gcmi, eps=var_eps)
+    kept_dims = int(X_gcmi.shape[0])
+
+    # Degenerate case: all dims dropped
+    if kept_dims == 0:
+        H_bits = 0.0
+    else:
+        # IMPORTANT: keep jitter in gc_entropy to break any remaining ties
+        H_bits = gc_entropy(
+            X_gcmi,
+            biascorrect=True,
+            jitter_eps=jitter_eps,
+            seed=seed,
+        )
+
+    if return_meta:
+        meta = {
+            "block_key": block_key,
+            "n_input_dims": n_input_dims,
+            "n_kept_dims": kept_dims,
+            "n_dropped_dims": n_input_dims - kept_dims,
+            "kept_mask_rows": keep_mask,
+            "var_eps": float(var_eps),
+        }
+        return float(H_bits), meta
+
     return float(H_bits)
 
 
-def gcmi_between_blocks(                                                                                                          
-     X_all,                                                                                                                        
-     block_slices,                                                                                                                 
-     block_key_x,                                                                                                                  
-     block_key_y,                                                                                                                  
-     jitter_eps=1e-10,                                                                                                             
-     seed=0,                                                                                                                       
- ):                                                                                                                                
-     """                                                                                                                           
-     Gaussian-Copula MI between two feature blocks:                                                                                
-         I( X_block_x ; X_block_y )                                                                                                
-                                                                                                                                   
-     Inputs:                                                                                                                       
-       X_all        : (N_samples, D_total)                                                                                         
-       block_slices : dict mapping block_name -> slice or index array                                                              
-       block_key_x  : name of first block, e.g. 'geom_all'                                                                         
-       block_key_y  : name of second block, e.g. 'elec_all'                                                                        
-                                                                                                                                   
-     Returns:                                                                                                                      
-       I_bits : float, mutual information in bits.                                                                                 
-     """                                                                                                                           
-     if block_key_x not in block_slices:                                                                                           
-         raise KeyError(                                                                                                           
-             f"Unknown block key '{block_key_x}'. Available keys: {list(block_slices.keys())}"                                     
-         )                                                                                                                         
-     if block_key_y not in block_slices:                                                                                           
-         raise KeyError(                                                                                                           
-             f"Unknown block key '{block_key_y}'. Available keys: {list(block_slices.keys())}"                                     
-         )                                                                                                                         
-                                                                                                                                   
-     col_slice_x = block_slices[block_key_x]                                                                                       
-     col_slice_y = block_slices[block_key_y]                                                                                       
-                                                                                                                                   
-     X_all = np.asarray(X_all, float)                                                                                              
-                                                                                                                                   
-     # select columns for each block: (N_samples, D_block)                                                                         
-     Xx = X_all[:, col_slice_x]                                                                                                    
-     Xy = X_all[:, col_slice_y]                                                                                                    
-                                                                                                                                   
-     # gcmi_cc expects (variables, trials) = (D_block, N_samples)                                                                  
-     Xx_gcmi = Xx.T   # (D_x, N_samples)                                                                                           
-     Xy_gcmi = Xy.T   # (D_y, N_samples)                                                                                           
-                                                                                                                                   
-     # jitter rows to avoid exact ties, same logic as prepare_gcmi_from_precomputed                                                
-     Xx_gcmi = _jitter_rows_for_gcmi(Xx_gcmi, eps=jitter_eps, seed=seed)                                                           
-     Xy_gcmi = _jitter_rows_for_gcmi(Xy_gcmi, eps=jitter_eps, seed=seed + 1)                                                       
-                                                                                                                                   
-     # Gaussian-copula MI between the two blocks                                                                                   
-     I_bits = gcmi_cc(Xx_gcmi, Xy_gcmi)                                                                                            
-     return float(I_bits)                     
+#def gcmi_between_blocks(                                                                                                          
+#     X_all,                                                                                                                        
+#     block_slices,                                                                                                                 
+#     block_key_x,                                                                                                                  
+#     block_key_y,                                                                                                                  
+#     jitter_eps=1e-10,                                                                                                             
+#     seed=0,                                                                                                                       
+# ):                                                                                                                                
+#     """                                                                                                                           
+#     Gaussian-Copula MI between two feature blocks:                                                                                
+#         I( X_block_x ; X_block_y )                                                                                                
+##                                                                                                                                   
+#     Inputs:                                                                                                                       
+#       X_all        : (N_samples, D_total)                                                                                         
+#       block_slices : dict mapping block_name -> slice or index array                                                              
+#       block_key_x  : name of first block, e.g. 'geom_all'                                                                         
+#       block_key_y  : name of second block, e.g. 'elec_all'                                                                        
+#                                                                                                                                   
+#     Returns:                                                                                                                      
+#       I_bits : float, mutual information in bits.                                                                                 
+#     """                                                                                                                           
+#     if block_key_x not in block_slices:                                                                                           
+#         raise KeyError(                                                                                                           
+#             f"Unknown block key '{block_key_x}'. Available keys: {list(block_slices.keys())}"                                     
+#         )                                                                                                                         
+#     if block_key_y not in block_slices:                                                                                           
+#         raise KeyError(                                                                                                           
+#             f"Unknown block key '{block_key_y}'. Available keys: {list(block_slices.keys())}"                                     
+#         )                                                                                                                         
+#                                                                                                                                   
+#     col_slice_x = block_slices[block_key_x]                                                                                       
+#     col_slice_y = block_slices[block_key_y]                                                                                       
+#                                                                                                                                   
+#     X_all = np.asarray(X_all, float)                                                                                              
+#                                                                                                                                   
+#     # select columns for each block: (N_samples, D_block)                                                                         
+#     Xx = X_all[:, col_slice_x]                                                                                                    
+#     Xy = X_all[:, col_slice_y]                                                                                                    
+#                                                                                                                                   
+#     # gcmi_cc expects (variables, trials) = (D_block, N_samples)                                                                  
+#     Xx_gcmi = Xx.T   # (D_x, N_samples)                                                                                           
+#     Xy_gcmi = Xy.T   # (D_y, N_samples)                                                                                           
+#                                                                                                                                   
+#     # jitter rows to avoid exact ties, same logic as prepare_gcmi_from_precomputed                                                
+#     Xx_gcmi = _jitter_rows_for_gcmi(Xx_gcmi, eps=jitter_eps, seed=seed)                                                           
+#     Xy_gcmi = _jitter_rows_for_gcmi(Xy_gcmi, eps=jitter_eps, seed=seed + 1)                                                       
+#                                                                                                                                   
+#     # Gaussian-copula MI between the two blocks                                                                                   
+#     I_bits = gcmi_cc(Xx_gcmi, Xy_gcmi)                                                                                            
+#     return float(I_bits)                     
+#
 
+
+def gcmi_between_blocks(
+    X_all,
+    block_slices,
+    block_key_x,
+    block_key_y,
+    jitter_eps=1e-10,
+    seed=0,
+    var_eps=1e-8,
+    return_meta=False,
+):
+    """
+    Gaussian-Copula MI between two feature blocks:
+        I( X_block_x ; X_block_y )
+
+    Robust to near-constant columns: they are dropped locally inside the estimator.
+
+    Returns:
+      I_bits : float
+      meta   : dict (optional)
+    """
+    if block_key_x not in block_slices:
+        raise KeyError(
+            f"Unknown block key '{block_key_x}'. Available keys: {list(block_slices.keys())}"
+        )
+    if block_key_y not in block_slices:
+        raise KeyError(
+            f"Unknown block key '{block_key_y}'. Available keys: {list(block_slices.keys())}"
+        )
+
+    col_slice_x = block_slices[block_key_x]
+    col_slice_y = block_slices[block_key_y]
+
+    X_all = np.asarray(X_all, float)
+
+    # select columns for each block: (N_samples, D_block)
+    Xx = X_all[:, col_slice_x]
+    Xy = X_all[:, col_slice_y]
+
+    # gcmi_cc expects (variables, trials) = (D_block, N_samples)
+    Xx_gcmi = Xx.T
+    Xy_gcmi = Xy.T
+
+    # jitter rows to avoid exact ties
+    Xx_gcmi = _jitter_rows_for_gcmi(Xx_gcmi, eps=jitter_eps, seed=seed)
+    Xy_gcmi = _jitter_rows_for_gcmi(Xy_gcmi, eps=jitter_eps, seed=seed + 1)
+
+    nx_in = int(Xx_gcmi.shape[0])
+    ny_in = int(Xy_gcmi.shape[0])
+
+    # Drop near-constant rows locally
+    Xx_gcmi, keep_x = _drop_near_constant_rows_for_gcmi(Xx_gcmi, eps=var_eps)
+    Xy_gcmi, keep_y = _drop_near_constant_rows_for_gcmi(Xy_gcmi, eps=var_eps)
+
+    nx_keep = int(Xx_gcmi.shape[0])
+    ny_keep = int(Xy_gcmi.shape[0])
+
+    if nx_keep == 0 or ny_keep == 0:
+        I_bits = 0.0
+    else:
+        I_bits = gcmi_cc(Xx_gcmi, Xy_gcmi)
+
+    if return_meta:
+        meta = {
+            "block_key_x": block_key_x,
+            "block_key_y": block_key_y,
+            "n_input_dims_x": nx_in,
+            "n_input_dims_y": ny_in,
+            "n_kept_dims_x": nx_keep,
+            "n_kept_dims_y": ny_keep,
+            "n_dropped_dims_x": nx_in - nx_keep,
+            "n_dropped_dims_y": ny_in - ny_keep,
+            "kept_mask_x": keep_x,
+            "kept_mask_y": keep_y,
+            "var_eps": float(var_eps),
+        }
+        return float(I_bits), meta
+
+    return float(I_bits)
 
 
 
